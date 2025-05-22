@@ -8,6 +8,9 @@
 define('MAX_DNS_LOOKUPS_MECHANISMS', 10); // Limite RFC per meccanismi e redirect SPF
 define('MAX_RECURSION_DEPTH', 10);       // Protezione aggiuntiva per la profondità di include/redirect SPF
 define('MAX_VOID_LOOKUPS', 2);           // Limite RFC per lookup nulli SPF (RFC 7208, Sezione 4.6.4)
+define('DNS_ROTATION_ATTEMPTS', 3);      // Numero di server DNS da provare in rotazione
+define('DIG_TIMEOUT_PER_QUERY', 1);      // Timeout per singola query dig in secondi
+define('DIG_TIMEOUT_OVERALL', 2);        // Timeout complessivo per il comando dig in secondi
 
 // --- Custom Exception Classes ---
 class SpfException extends \Exception {}
@@ -34,19 +37,22 @@ class SpfDmarcCheck {
     // Lista di server DNS pubblici per la rotazione
     private static array $publicDnsServers = [
         '1.1.1.1',    // Cloudflare
-        '1.0.0.1',    // Cloudflare Secondary
         '8.8.8.8',    // Google Public DNS
-        '8.8.4.4',    // Google Public DNS Secondary
         '9.9.9.9',    // Quad9
+        '1.0.0.1',    // Cloudflare Secondary
+        '8.8.4.4',    // Google Public DNS Secondary
         '149.112.112.112', // Quad9 Secondary
         '208.67.222.222', // OpenDNS
         '208.67.220.220', // OpenDNS Secondary
     ];
-    private static int $currentDnsServerIndex = 0;
+    private static int $currentDnsServerIndex = 0; // Indice per la rotazione dei server DNS
 
     public function __construct(string $domain, ?string $dnsServerOverride = null) {
         $this->domain = $domain;
         $this->initialDnsServerOverride = $dnsServerOverride;
+        // Resetta l'indice di rotazione per ogni nuova istanza,
+        // così ogni analisi completa inizia dal primo server della lista se in rotazione.
+        self::$currentDnsServerIndex = 0; 
         $this->report = $this->_analyzeEmailAuthentication();
     }
 
@@ -71,67 +77,96 @@ class SpfDmarcCheck {
         self::$currentDnsServerIndex = (self::$currentDnsServerIndex + 1) % count(self::$publicDnsServers);
         return $selectedServer;
     }
+    
+    /**
+     * Esegue il comando dig effettivo con timeout.
+     */
+    private function _executeDigQuery(string $hostname, string $typeStr, string $serverToUse): array {
+        $results = [];
+        $digPath = trim(@shell_exec('command -v dig'));
+        if (empty($digPath) || !is_executable($digPath)) { // Dovrebbe essere già stato controllato, ma per sicurezza
+            throw new DigCommandNotFoundException("Command 'dig' not found or not executable.");
+        }
+
+        $timeoutOpt = DIG_TIMEOUT_PER_QUERY;
+        $triesOpt = 1; // Non vogliamo che dig faccia i suoi tentativi interni se gestiamo la rotazione esternamente
+        $timeOpt = DIG_TIMEOUT_OVERALL; 
+
+        $command = "dig @" . escapeshellarg($serverToUse) . " " . escapeshellarg($hostname) . " " . escapeshellarg($typeStr) . " +short +norrcomments +nocmd +noquestion +nocomments +nostats +timeout=" . $timeoutOpt . " +tries=" . $triesOpt . " +time=" . $timeOpt;
+        
+        $output = @shell_exec($command);
+
+        if ($output === null || $output === false || trim($output) === '') { 
+            // Timeout o nessun record o altro errore di dig.
+            // shell_exec non dà un modo facile per distinguere timeout da "nessun record" per NXDOMAIN.
+            // Se l'output è vuoto, potrebbe essere un timeout o effettivamente nessun record.
+            // Trattiamo questo come un errore temporaneo per questo server, permettendo la rotazione.
+            throw new SpfDnsTempErrorException("DNS query to $serverToUse for $hostname ($typeStr) failed or timed out (output: '" . trim($output ?? '') . "').");
+        }
+
+        $lines = explode("\n", trim($output));
+        if (empty(trim($output)) && count($lines) === 1 && $lines[0] === '') return []; // Genuinamente nessun output
+
+        foreach ($lines as $line) { 
+            $line = trim($line); if (empty($line)) continue;
+            switch (strtoupper($typeStr)) {
+                case 'TXT': $results[] = ['txt' => str_replace('"', '', $line)]; break;
+                case 'A': if (filter_var($line, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) $results[] = ['ip' => $line]; break;
+                case 'AAAA': if (filter_var($line, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)) $results[] = ['ipv6' => $line]; break;
+                case 'MX': $parts = explode(" ", $line); if (count($parts) == 2 && is_numeric($parts[0])) $results[] = ['pri' => intval($parts[0]), 'target' => rtrim($parts[1], '.')]; break;
+            }
+        }
+        return $results;
+    }
+
 
     /**
-     * Esegue una query DNS.
+     * Esegue una query DNS. Gestisce l'override e la rotazione dei server.
      */
-    private function _performDnsQuery(string $hostname, string $typeStr, ?string &$dnsServerToUseRef = null): array|false {
-        $results = [];
-        $serverForThisQuery = $dnsServerToUseRef; 
-
-        if ($serverForThisQuery) { 
-            $digPath = trim(@shell_exec('command -v dig'));
-            if (empty($digPath) || !is_executable($digPath)) {
-                throw new DigCommandNotFoundException("Command 'dig' not found or not executable, but a specific DNS server was requested ($serverForThisQuery).");
+    private function _performDnsQuery(string $hostname, string $typeStr, ?string &$dnsServerUsedForReport = null): array|false {
+        if ($dnsServerUsedForReport !== null) { // Override fornito, usa solo questo server
+            try {
+                return $this->_executeDigQuery($hostname, $typeStr, $dnsServerUsedForReport);
+            } catch (DigCommandNotFoundException $e) {
+                // Se dig non è trovato ma un server è specificato, è un errore.
+                // Non possiamo fare fallback a dns_get_record perché non possiamo specificare il server.
+                throw $e;
+            } catch (SpfDnsTempErrorException $e) {
+                // L'override è fallito (timeout/errore), rilancia per essere gestito dal chiamante.
+                throw $e;
             }
-            $command = "dig @" . escapeshellarg($serverForThisQuery) . " " . escapeshellarg($hostname) . " " . escapeshellarg($typeStr) . " +short +norrcomments +nocmd +noquestion +nocomments +nostats";
-            $output = @shell_exec($command);
-            if ($output === null || $output === false) { if (trim($output ?? '') === '') return []; throw new SpfDnsTempErrorException("Execution of 'dig' failed or no output for $hostname ($typeStr) on server $serverForThisQuery.");}
-            $lines = explode("\n", trim($output));
-            if (empty(trim($output)) && count($lines) === 1 && $lines[0] === '') return [];
-            foreach ($lines as $line) { 
-                $line = trim($line); if (empty($line)) continue;
-                switch (strtoupper($typeStr)) {
-                    case 'TXT': $results[] = ['txt' => str_replace('"', '', $line)]; break;
-                    case 'A': if (filter_var($line, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) $results[] = ['ip' => $line]; break;
-                    case 'AAAA': if (filter_var($line, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)) $results[] = ['ipv6' => $line]; break;
-                    case 'MX': $parts = explode(" ", $line); if (count($parts) == 2 && is_numeric($parts[0])) $results[] = ['pri' => intval($parts[0]), 'target' => rtrim($parts[1], '.')]; break;
-                }
-            }
-        } else { 
+        } else { // Nessun override, tenta la rotazione usando dig se disponibile, altrimenti dns_get_record
             $canUseDig = false;
             $digPath = trim(@shell_exec('command -v dig'));
             if (!empty($digPath) && is_executable($digPath)) $canUseDig = true;
 
             if ($canUseDig) {
-                $serverForThisQuery = self::_getNextPublicDnsServer();
-                $dnsServerToUseRef = $serverForThisQuery; // Aggiorna per il report
-                $command = "dig @" . escapeshellarg($serverForThisQuery) . " " . escapeshellarg($hostname) . " " . escapeshellarg($typeStr) . " +short +norrcomments +nocmd +noquestion +nocomments +nostats";
-                $output = @shell_exec($command);
-                if ($output === null || $output === false) { if (trim($output ?? '') === '') return []; throw new SpfDnsTempErrorException("Execution of 'dig' failed or no output for $hostname ($typeStr) on rotated server $serverForThisQuery.");}
-                $lines = explode("\n", trim($output));
-                if (empty(trim($output)) && count($lines) === 1 && $lines[0] === '') return [];
-                foreach ($lines as $line) { 
-                    $line = trim($line); if (empty($line)) continue;
-                    switch (strtoupper($typeStr)) {
-                        case 'TXT': $results[] = ['txt' => str_replace('"', '', $line)]; break;
-                        case 'A': if (filter_var($line, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) $results[] = ['ip' => $line]; break;
-                        case 'AAAA': if (filter_var($line, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)) $results[] = ['ipv6' => $line]; break;
-                        case 'MX': $parts = explode(" ", $line); if (count($parts) == 2 && is_numeric($parts[0])) $results[] = ['pri' => intval($parts[0]), 'target' => rtrim($parts[1], '.')]; break;
-                    }
+                $lastException = null;
+                for ($i = 0; $i < DNS_ROTATION_ATTEMPTS; $i++) {
+                    $serverToTry = self::_getNextPublicDnsServer();
+                    $dnsServerUsedForReport = $serverToTry; // Aggiorna per il report con il server corrente
+                    try {
+                        return $this->_executeDigQuery($hostname, $typeStr, $serverToTry);
+                    } catch (SpfDnsTempErrorException $e) {
+                        $lastException = $e;
+                        // Log warning nel report (se accessibile) o semplicemente continua
+                        // Questo log dovrebbe essere fatto dal chiamante che ha il contesto del report
+                        // Per ora, continuiamo e l'errore finale sarà rilanciato se tutti falliscono.
+                    } catch (DigCommandNotFoundException $e) { throw $e; /* Improbabile qui, già controllato */ }
                 }
+                if ($lastException !== null) throw $lastException; // Tutti i tentativi di rotazione sono falliti
+                return []; // Non dovrebbe essere raggiunto se lastException è sempre impostato
             } else { 
-                $dnsServerToUseRef = null; 
+                $dnsServerUsedForReport = null; // Indica che è stato usato il DNS di sistema
                 $phpRecordType = match (strtoupper($typeStr)) {
                     'A' => DNS_A, 'AAAA' => DNS_AAAA, 'MX' => DNS_MX, 'TXT' => DNS_TXT, default => 0 
                 };
-                if ($phpRecordType === 0) { error_log("Unsupported DNS type in _performDnsQuery: " . $typeStr); return false; }
+                if ($phpRecordType === 0) { error_log("Unsupported DNS type: " . $typeStr); return false; }
                 $dnsRecs = @dns_get_record($hostname, $phpRecordType);
-                if ($dnsRecs === false) return [];
+                if ($dnsRecs === false) return []; // Tratta come nessun record trovato o errore
                 return $dnsRecs; 
             }
         }
-        return $results;
     }
 
     /**
@@ -139,8 +174,7 @@ class SpfDmarcCheck {
      */
     private function _analyzeDomainSpfInternal(?string &$dnsServerUsedForReport): array {
         $spfDetails = [
-            'domain' => $this->domain,
-            'dnsServerUsed' => $dnsServerUsedForReport,
+            'domain' => $this->domain, 'dnsServerUsed' => $dnsServerUsedForReport,
             'queriedDnsForTxt' => false, 'selectedSpfRecord' => null,
             'formalValidity' => ['startsWithVspf1' => false, 'hasValidAllMechanism' => false, 'dnsMechanismLookupCount' => 0, 'maxDnsMechanismLookups' => MAX_DNS_LOOKUPS_MECHANISMS, 'voidLookupCount' => 0, 'maxVoidLookups' => MAX_VOID_LOOKUPS, 'hasRedirectModifier' => false, 'redirectDomain' => null, 'syntaxErrors' => [], 'warnings' => [], 'explanationDomain' => null,],
             'parsedMechanisms' => [], 'allMechanismDetails' => null,
@@ -148,41 +182,52 @@ class SpfDmarcCheck {
             'summary' => ['totalDnsMechanismLookupsUsed' => 0, 'finalProcessingResult' => 'NEUTRAL', 'evaluationLog' => []]
         ];
         $dnsMechanismLookupCount = 0; $voidLookupCount = 0;
-        $currentQueryDnsServer = $dnsServerUsedForReport;
-
+        
         try {
-            $txtQueryResults = $this->_performDnsQuery($this->domain, 'TXT', $currentQueryDnsServer);
-            $spfDetails['dnsServerUsed'] = $currentQueryDnsServer; 
+            // $dnsServerUsedForReport è passato per riferimento e sarà aggiornato da _performDnsQuery
+            $txtQueryResults = $this->_performDnsQuery($this->domain, 'TXT', $dnsServerUsedForReport);
+            $spfDetails['dnsServerUsed'] = $dnsServerUsedForReport; // Riflette il server usato
             $spfDetails['queriedDnsForTxt'] = true;
-            if ($txtQueryResults === false) throw new SpfDnsTempErrorException("Initial DNS query for TXT records failed for domain '{$this->domain}'.");
+
+            if ($txtQueryResults === false && $dnsServerUsedForReport === null && !trim(@shell_exec('command -v dig'))) {
+                 // Caso speciale: dns_get_record() potrebbe restituire false per NXDOMAIN
+                 // Se stiamo usando dns_get_record (nessun server specificato e dig non trovato)
+                 // e otteniamo false, trattalo come nessun record.
+                 throw new SpfNoRecordException("No TXT records found for '{$this->domain}' (or DNS query failed with system resolver).");
+            } elseif ($txtQueryResults === false) { // Errore grave se dig era in uso o override
+                 throw new SpfDnsTempErrorException("Initial DNS query for TXT records failed for domain '{$this->domain}'.");
+            }
+            
             $spfRecordStrings = [];
             if (!empty($txtQueryResults)) foreach ($txtQueryResults as $record) if (($record['txt'] ?? null) && preg_match('/^v=spf1/i', $record['txt'])) $spfRecordStrings[] = $record['txt'];
             if (empty($spfRecordStrings)) throw new SpfNoRecordException("No SPF record (v=spf1) found for '{$this->domain}'.");
             if (count($spfRecordStrings) > 1) throw new SpfMultipleRecordsException("Multiple SPF records found for '{$this->domain}'.");
             $spfDetails['selectedSpfRecord'] = $spfRecordStrings[0];
             $spfDetails['formalValidity']['startsWithVspf1'] = true;
-            $this->_processSpfRecordSegment($spfDetails, $this->domain, $spfDetails['selectedSpfRecord'], $dnsMechanismLookupCount, $voidLookupCount, 0, $currentQueryDnsServer);
+            
+            // Usa il server che ha funzionato per la query TXT iniziale per le query successive dentro SPF.
+            $this->_processSpfRecordSegment($spfDetails, $this->domain, $spfDetails['selectedSpfRecord'], $dnsMechanismLookupCount, $voidLookupCount, 0, $spfDetails['dnsServerUsed']);
+            
+            $spfDetails['formalValidity']['voidLookupCount'] = $voidLookupCount; // Assicura che sia aggiornato
             if ($spfDetails['summary']['finalProcessingResult'] !== 'PERMERROR' && $spfDetails['summary']['finalProcessingResult'] !== 'TEMPERROR') {
                 if ($spfDetails['allMechanismDetails'] !== null) $spfDetails['summary']['finalProcessingResult'] = self::_mapQualifierToResult($spfDetails['allMechanismDetails']['qualifier']);
                 elseif ($spfDetails['formalValidity']['hasRedirectModifier']) { if ($spfDetails['summary']['finalProcessingResult'] === 'NEUTRAL' && empty($spfDetails['allMechanismDetails'])) $spfDetails['summary']['finalProcessingResult'] = 'NEUTRAL';}
                 else $spfDetails['summary']['finalProcessingResult'] = 'NEUTRAL'; 
             }
-        } catch (SpfException $e) { // Cattura tutte le eccezioni SPF e DNS correlate
+        } catch (SpfException $e) { 
             $spfDetails['formalValidity']['syntaxErrors'][] = $e->getMessage();
             if ($e instanceof SpfNoRecordException) $spfDetails['summary']['finalProcessingResult'] = 'NONE';
             elseif ($e instanceof SpfMultipleRecordsException || $e instanceof SpfLimitExceededException || $e instanceof SpfSyntaxException || $e instanceof SpfDnsPermErrorException || $e instanceof SpfProcessingException) $spfDetails['summary']['finalProcessingResult'] = 'PERMERROR';
-            else $spfDetails['summary']['finalProcessingResult'] = 'TEMPERROR'; // SpfDnsTempErrorException, DigCommandNotFoundException, Exception generica
+            else $spfDetails['summary']['finalProcessingResult'] = 'TEMPERROR'; 
         }
         $spfDetails['summary']['totalDnsMechanismLookupsUsed'] = $dnsMechanismLookupCount;
         $spfDetails['formalValidity']['dnsMechanismLookupCount'] = $dnsMechanismLookupCount;
-        $spfDetails['formalValidity']['voidLookupCount'] = $voidLookupCount;
-        $dnsServerUsedForReport = $spfDetails['dnsServerUsed'];
         return $spfDetails;
     }
 
     /** Funzione interna ricorsiva per processare un segmento di record SPF. */
-    private function _processSpfRecordSegment(array &$reportRef, string $currentDomain, string $spfString, int &$dnsMechanismLookupCount, int &$voidLookupCount, int $recursionDepth, ?string $dnsServer) {
-        if ($recursionDepth >= MAX_RECURSION_DEPTH) throw new SpfLimitExceededException("Maximum recursion depth ($MAX_RECURSION_DEPTH) exceeded for include/redirect on domain '$currentDomain'.");
+    private function _processSpfRecordSegment(array &$reportRef, string $currentDomain, string $spfString, int &$dnsMechanismLookupCount, int &$voidLookupCount, int $recursionDepth, ?string $dnsServerForSegment) {
+        if ($recursionDepth >= MAX_RECURSION_DEPTH) throw new SpfLimitExceededException("Maximum recursion depth (" . MAX_RECURSION_DEPTH . ") exceeded for include/redirect on domain '$currentDomain'.");
         $spfContent = preg_replace('/^v=spf1\s+/i', '', $spfString);
         $terms = preg_split('/\s+/', trim($spfContent));
         $redirectModifierEncountered = false;
@@ -198,7 +243,10 @@ class SpfDmarcCheck {
             else { $parsedMechanism['mechanism'] = strtolower($termPart); }
             
             try {
-                $currentQueryDnsServerForMech = $dnsServer;
+                // Usa il $dnsServerForSegment passato per tutte le query DNS all'interno di questo segmento.
+                // Questo server è quello che è riuscito per la query TXT iniziale del record SPF corrente (o incluso/rediretto).
+                $currentQueryDnsServerForMech = $dnsServerForSegment; 
+
                 switch ($parsedMechanism['mechanism']) {
                     case 'all': $reportRef['formalValidity']['hasValidAllMechanism'] = true; $reportRef['allMechanismDetails'] = ['term' => $parsedMechanism['qualifier'] . $parsedMechanism['mechanism'], 'qualifier' => $parsedMechanism['qualifier'], 'result' => $parsedMechanism['effectiveResultIfMatched']]; $reportRef['summary']['evaluationLog'][] = "Mechanism 'all': {$parsedMechanism['effectiveResultIfMatched']}"; break;
                     case 'ip4': case 'ip6': $ipToCheck = explode('/', $parsedMechanism['value'])[0]; $flag = $parsedMechanism['mechanism'] == 'ip4' ? FILTER_FLAG_IPV4 : FILTER_FLAG_IPV6; if (filter_var($ipToCheck, FILTER_VALIDATE_IP, $flag)) { $parsedMechanism['ipsFound'][] = $parsedMechanism['value']; $reportRef['collectedIpAddresses'][$parsedMechanism['mechanism']][] = $parsedMechanism['value']; } else { throw new SpfSyntaxException("Invalid IP: {$parsedMechanism['mechanism']}:{$parsedMechanism['value']}."); } break;
@@ -206,19 +254,19 @@ class SpfDmarcCheck {
                         if ($dnsMechanismLookupCount >= MAX_DNS_LOOKUPS_MECHANISMS) throw new SpfLimitExceededException("DNS lookup limit reached at '{$term}'.");
                         $dnsMechanismLookupCount++; $parsedMechanism['lookupCost'] = 1; $lookupDomain = !empty($parsedMechanism['value']) ? self::_macroExpand($parsedMechanism['value'], $currentDomain, [], $currentQueryDnsServerForMech) : $currentDomain; $ipsFromMech = []; $isVoidThisMechanism = true;
                         if ($parsedMechanism['mechanism'] == 'a') {
-                            $dnsRecordsA = $this->_performDnsQuery($lookupDomain, 'A', $currentQueryDnsServerForMech); if ($currentQueryDnsServerForMech !== $reportRef['dnsServerUsed'] && $reportRef['dnsServerUsed'] === null) $reportRef['dnsServerUsed'] = $currentQueryDnsServerForMech;
-                            if ($dnsRecordsA) foreach ($dnsRecordsA as $r) if(isset($r['ip'])) {$ipsFromMech[] = $r['ip']; $isVoidThisMechanism = false;}
-                            $dnsRecordsAAAA = $this->_performDnsQuery($lookupDomain, 'AAAA', $currentQueryDnsServerForMech); if ($currentQueryDnsServerForMech !== $reportRef['dnsServerUsed'] && $reportRef['dnsServerUsed'] === null) $reportRef['dnsServerUsed'] = $currentQueryDnsServerForMech;
-                            if ($dnsRecordsAAAA) foreach ($dnsRecordsAAAA as $r) if(isset($r['ipv6'])) {$ipsFromMech[] = $r['ipv6']; $isVoidThisMechanism = false;}
+                            $dnsRecordsA = $this->_performDnsQuery($lookupDomain, 'A', $currentQueryDnsServerForMech); 
+                            if ($dnsRecordsA) { foreach ($dnsRecordsA as $r) if(isset($r['ip'])) {$ipsFromMech[] = $r['ip']; $isVoidThisMechanism = false;} }
+                            $dnsRecordsAAAA = $this->_performDnsQuery($lookupDomain, 'AAAA', $currentQueryDnsServerForMech); 
+                            if ($dnsRecordsAAAA) { foreach ($dnsRecordsAAAA as $r) if(isset($r['ipv6'])) {$ipsFromMech[] = $r['ipv6']; $isVoidThisMechanism = false;} }
                             if (!empty($ipsFromMech)) $reportRef['collectedIpAddresses']['fromA'] = array_merge($reportRef['collectedIpAddresses']['fromA'], $ipsFromMech);
                         } else { // mx
-                            $mxHosts = $this->_performDnsQuery($lookupDomain, 'MX', $currentQueryDnsServerForMech); if ($currentQueryDnsServerForMech !== $reportRef['dnsServerUsed'] && $reportRef['dnsServerUsed'] === null) $reportRef['dnsServerUsed'] = $currentQueryDnsServerForMech;
+                            $mxHosts = $this->_performDnsQuery($lookupDomain, 'MX', $currentQueryDnsServerForMech); 
                             if ($mxHosts) { $isVoidThisMechanism = false; uasort($mxHosts, fn($a,$b) => ($a['pri']??INF)<=>($b['pri']??INF));
                                 foreach ($mxHosts as $mx) { if (!isset($mx['target'])) continue; if ($dnsMechanismLookupCount >= MAX_DNS_LOOKUPS_MECHANISMS) throw new SpfLimitExceededException("DNS lookup limit at MX host '{$mx['target']}'.");
                                     $dnsMechanismLookupCount++; $parsedMechanism['lookupCost']++; $isMxHostVoid = true; $mxTargetDomain = self::_macroExpand($mx['target'], $currentDomain, [], $currentQueryDnsServerForMech);
-                                    $mx_arecords = $this->_performDnsQuery($mxTargetDomain, 'A', $currentQueryDnsServerForMech); if ($currentQueryDnsServerForMech !== $reportRef['dnsServerUsed'] && $reportRef['dnsServerUsed'] === null) $reportRef['dnsServerUsed'] = $currentQueryDnsServerForMech;
+                                    $mx_arecords = $this->_performDnsQuery($mxTargetDomain, 'A', $currentQueryDnsServerForMech); 
                                     if ($mx_arecords) foreach ($mx_arecords as $r) if(isset($r['ip'])) {$ipsFromMech[] = $r['ip']; $isMxHostVoid = false;}
-                                    $mx_aaaa_records = $this->_performDnsQuery($mxTargetDomain, 'AAAA', $currentQueryDnsServerForMech); if ($currentQueryDnsServerForMech !== $reportRef['dnsServerUsed'] && $reportRef['dnsServerUsed'] === null) $reportRef['dnsServerUsed'] = $currentQueryDnsServerForMech;
+                                    $mx_aaaa_records = $this->_performDnsQuery($mxTargetDomain, 'AAAA', $currentQueryDnsServerForMech); 
                                     if ($mx_aaaa_records) foreach ($mx_aaaa_records as $r) if(isset($r['ipv6'])) {$ipsFromMech[] = $r['ipv6']; $isMxHostVoid = false;}
                                     if ($isMxHostVoid) { $voidLookupCount++; if ($voidLookupCount > MAX_VOID_LOOKUPS) throw new SpfLimitExceededException("Void lookup limit at MX host '{$mxTargetDomain}'."); }
                                 } if (!empty($ipsFromMech)) $reportRef['collectedIpAddresses']['fromMx'] = array_merge($reportRef['collectedIpAddresses']['fromMx'], $ipsFromMech);
@@ -227,7 +275,7 @@ class SpfDmarcCheck {
                     case 'include':
                         if ($dnsMechanismLookupCount >= MAX_DNS_LOOKUPS_MECHANISMS) throw new SpfLimitExceededException("DNS lookup limit at 'include:{$parsedMechanism['value']}'.");
                         $dnsMechanismLookupCount++; $parsedMechanism['lookupCost'] = 1; $includeDomain = self::_macroExpand($parsedMechanism['value'], $currentDomain, [], $currentQueryDnsServerForMech);
-                        $txtRecordsInclude = $this->_performDnsQuery($includeDomain, 'TXT', $currentQueryDnsServerForMech); if ($currentQueryDnsServerForMech !== $reportRef['dnsServerUsed'] && $reportRef['dnsServerUsed'] === null) $reportRef['dnsServerUsed'] = $currentQueryDnsServerForMech;
+                        $txtRecordsInclude = $this->_performDnsQuery($includeDomain, 'TXT', $currentQueryDnsServerForMech); 
                         $selectedIncludedSpf = null; $isIncludeVoid = true;
                         if ($txtRecordsInclude) { $spfStringsInclude = []; foreach($txtRecordsInclude as $r) if (isset($r['txt']) && preg_match('/^v=spf1/i', $r['txt'])) $spfStringsInclude[] = $r['txt']; if (count($spfStringsInclude) === 1) { $selectedIncludedSpf = $spfStringsInclude[0]; $isIncludeVoid = false; } elseif (count($spfStringsInclude) > 1) throw new SpfSyntaxException("Included domain '$includeDomain' has multiple SPF records."); }
                         if ($isIncludeVoid) $voidLookupCount++; if ($voidLookupCount > MAX_VOID_LOOKUPS) throw new SpfLimitExceededException("Void lookup limit at 'include:{$includeDomain}'.");
@@ -240,7 +288,7 @@ class SpfDmarcCheck {
                     case 'redirect':
                         if ($dnsMechanismLookupCount >= MAX_DNS_LOOKUPS_MECHANISMS) throw new SpfLimitExceededException("DNS lookup limit at 'redirect={$parsedMechanism['value']}'.");
                         $dnsMechanismLookupCount++; $parsedMechanism['lookupCost'] = 1; $reportRef['formalValidity']['hasRedirectModifier'] = true; $redirectDomain = self::_macroExpand($parsedMechanism['value'], $currentDomain, [], $currentQueryDnsServerForMech); $reportRef['formalValidity']['redirectDomain'] = $redirectDomain; $redirectModifierEncountered = true;
-                        $txtRecordsRedirect = $this->_performDnsQuery($redirectDomain, 'TXT', $currentQueryDnsServerForMech); if ($currentQueryDnsServerForMech !== $reportRef['dnsServerUsed'] && $reportRef['dnsServerUsed'] === null) $reportRef['dnsServerUsed'] = $currentQueryDnsServerForMech;
+                        $txtRecordsRedirect = $this->_performDnsQuery($redirectDomain, 'TXT', $currentQueryDnsServerForMech); 
                         $selectedRedirectSpf = null; $isRedirectVoid = true;
                         if ($txtRecordsRedirect) { $spfStringsRedirect = []; foreach($txtRecordsRedirect as $r) if (isset($r['txt']) && preg_match('/^v=spf1/i', $r['txt'])) $spfStringsRedirect[] = $r['txt']; if (count($spfStringsRedirect) === 1) { $selectedRedirectSpf = $spfStringsRedirect[0]; $isRedirectVoid = false; } elseif (count($spfStringsRedirect) > 1) throw new SpfSyntaxException("Redirect domain '$redirectDomain' has multiple SPF records."); }
                         if ($isRedirectVoid) $voidLookupCount++; if ($voidLookupCount > MAX_VOID_LOOKUPS) throw new SpfLimitExceededException("Void lookup limit at 'redirect={$redirectDomain}'.");
@@ -253,7 +301,7 @@ class SpfDmarcCheck {
                     case 'exists':
                         if ($dnsMechanismLookupCount >= MAX_DNS_LOOKUPS_MECHANISMS) throw new SpfLimitExceededException("DNS lookup limit at 'exists:{$parsedMechanism['value']}'.");
                         $dnsMechanismLookupCount++; $parsedMechanism['lookupCost'] = 1; $existsDomain = self::_macroExpand($parsedMechanism['value'], $currentDomain, [], $currentQueryDnsServerForMech);
-                        $exists_arecords = $this->_performDnsQuery($existsDomain, 'A', $currentQueryDnsServerForMech); if ($currentQueryDnsServerForMech !== $reportRef['dnsServerUsed'] && $reportRef['dnsServerUsed'] === null) $reportRef['dnsServerUsed'] = $currentQueryDnsServerForMech;
+                        $exists_arecords = $this->_performDnsQuery($existsDomain, 'A', $currentQueryDnsServerForMech); 
                         if (!$exists_arecords || empty($exists_arecords)) { $voidLookupCount++; $parsedMechanism['isVoidLookup'] = true; }
                         if ($voidLookupCount > MAX_VOID_LOOKUPS) throw new SpfLimitExceededException("Void lookup limit at 'exists:{$existsDomain}'."); break;
                     case 'ptr': $reportRef['formalValidity']['warnings'][] = "PTR mechanism used ({$term}). Discouraged. Not implemented."; break;
@@ -289,12 +337,19 @@ class SpfDmarcCheck {
             'failureOptions' => [], 'errors' => [], 'warnings' => []
         ];
         $dmarcQueryDomain = $dmarcDetails['dnsQueryDomain'];
-        $currentQueryDnsServer = $dnsServerUsedForReport;
-
+        
         try {
-            $txtRecords = $this->_performDnsQuery($dmarcQueryDomain, 'TXT', $currentQueryDnsServer);
-            $dmarcDetails['dnsServerUsed'] = $currentQueryDnsServer;
+            // $dnsServerUsedForReport è passato per riferimento e sarà aggiornato da _performDnsQuery
+            $txtRecords = $this->_performDnsQuery($dmarcQueryDomain, 'TXT', $dnsServerUsedForReport);
+            $dmarcDetails['dnsServerUsed'] = $dnsServerUsedForReport; // Riflette il server usato
             $dmarcRecordString = null;
+
+            if ($txtRecords === false && $dnsServerUsedForReport === null && !trim(@shell_exec('command -v dig'))) {
+                 throw new DmarcNoRecordException("No TXT records found for '$dmarcQueryDomain' (or DNS query failed with system resolver).");
+            } elseif ($txtRecords === false) {
+                 throw new SpfDnsTempErrorException("DNS query for DMARC records failed for domain '$dmarcQueryDomain'.");
+            }
+
             if ($txtRecords) foreach ($txtRecords as $record) if (($record['txt'] ?? null) && stripos($record['txt'], 'v=DMARC1') === 0) { if ($dmarcRecordString !== null) throw new DmarcSyntaxException("Multiple DMARC records for '$dmarcQueryDomain'."); $dmarcRecordString = $record['txt']; }
             if ($dmarcRecordString) {
                 $dmarcDetails['recordFound'] = true; $dmarcDetails['record'] = $dmarcRecordString;
@@ -318,7 +373,6 @@ class SpfDmarcCheck {
         } catch (DmarcException $e) { $dmarcDetails['errors'][] = $e->getMessage();
         } catch (SpfDnsException $e) { $dmarcDetails['errors'][] = "DNS error for $dmarcQueryDomain: " . $e->getMessage();
         } catch (\Exception $e) { $dmarcDetails['errors'][] = "Error querying DMARC for $dmarcQueryDomain: " . $e->getMessage(); }
-        $dnsServerUsedForReport = $dmarcDetails['dnsServerUsed'];
         return $dmarcDetails;
     }
 
@@ -331,45 +385,45 @@ class SpfDmarcCheck {
         $validSpf = false; $validDmarc = false;
         $digCommandError = null; 
         $dnsServerForSpf = $this->initialDnsServerOverride; 
+        $dnsServerForDmarc = $this->initialDnsServerOverride; // DMARC userà l'override o la sua rotazione
 
         try {
-            $spfReport = $this->_analyzeDomainSpfInternal($dnsServerForSpf); // Passa per riferimento
+            $spfReport = $this->_analyzeDomainSpfInternal($dnsServerForSpf); 
             $spfAnalysisDetails = $spfReport;
             if (!in_array($spfReport['summary']['finalProcessingResult'], ['PERMERROR', 'TEMPERROR', 'NONE'])) $validSpf = true; 
         } catch (DigCommandNotFoundException $e) { 
             $digCommandError = $e->getMessage(); 
+            $spfAnalysisDetails = $this->_getEmptySpfDetails(); // Popola con struttura vuota + errore
             $spfAnalysisDetails['formalValidity']['syntaxErrors'][] = "Configuration error for SPF: " . $digCommandError;
             $spfAnalysisDetails['summary']['finalProcessingResult'] = 'TEMPERROR';
+            $spfAnalysisDetails['dnsServerUsed'] = $this->initialDnsServerOverride; // Riflette il tentativo
         } catch (\Exception $e) {
-            if (!isset($spfAnalysisDetails['formalValidity'])) $spfAnalysisDetails['formalValidity'] = ['syntaxErrors' => []];
-            if (!isset($spfAnalysisDetails['summary'])) $spfAnalysisDetails['summary'] = [];
+            $spfAnalysisDetails = $this->_getEmptySpfDetails();
             $spfAnalysisDetails['formalValidity']['syntaxErrors'][] = "Unexpected error during SPF analysis: " . $e->getMessage();
             $spfAnalysisDetails['summary']['finalProcessingResult'] = 'TEMPERROR';
+            $spfAnalysisDetails['dnsServerUsed'] = $dnsServerForSpf;
         }
         
-        // Il server DNS per DMARC sarà l'override iniziale se fornito, altrimenti DMARC gestirà la sua rotazione.
-        $dnsServerForDmarc = $this->initialDnsServerOverride;
-
         if ($digCommandError) {
-            if (!isset($dmarcAnalysisDetails['errors'])) $dmarcAnalysisDetails['errors'] = [];
+            $dmarcAnalysisDetails = $this->_getEmptyDmarcDetails();
             $dmarcAnalysisDetails['errors'][] = "DMARC check skipped due to Dig configuration error: " . $digCommandError;
+            $dmarcAnalysisDetails['dnsServerUsed'] = $this->initialDnsServerOverride;
         } else {
             try {
-                $dmarcReport = $this->_analyzeDomainDmarcInternal($dnsServerForDmarc); // Passa per riferimento
+                $dmarcReport = $this->_analyzeDomainDmarcInternal($dnsServerForDmarc); 
                 $dmarcAnalysisDetails = $dmarcReport;
                 if ($dmarcReport['recordFound'] && !empty($dmarcReport['policy']) && empty($dmarcReport['errors'])) $validDmarc = true; 
-            } catch (DigCommandNotFoundException $e) { 
-                if (!isset($dmarcAnalysisDetails['errors'])) $dmarcAnalysisDetails['errors'] = [];
+            } catch (DigCommandNotFoundException $e) { // Improbabile qui se SPF è passato, ma per sicurezza
+                $dmarcAnalysisDetails = $this->_getEmptyDmarcDetails();
                 $dmarcAnalysisDetails['errors'][] = "Configuration error for DMARC: " . $e->getMessage();
+                $dmarcAnalysisDetails['dnsServerUsed'] = $dnsServerForDmarc;
             } catch (\Exception $e) {
-                if (!isset($dmarcAnalysisDetails['errors'])) $dmarcAnalysisDetails['errors'] = [];
+                $dmarcAnalysisDetails = $this->_getEmptyDmarcDetails();
                 $dmarcAnalysisDetails['errors'][] = "Unexpected error during DMARC analysis: " . $e->getMessage();
+                $dmarcAnalysisDetails['dnsServerUsed'] = $dnsServerForDmarc;
             }
         }
         
-        if (empty($spfAnalysisDetails)) $spfAnalysisDetails = ['domain' => $this->domain, 'dnsServerUsed' => $dnsServerForSpf, 'summary' => ['finalProcessingResult' => 'TEMPERROR'], 'formalValidity' => ['syntaxErrors' => ['SPF analysis could not be performed.']]];
-        if (empty($dmarcAnalysisDetails)) $dmarcAnalysisDetails = ['domain' => $this->domain, 'dnsServerUsed' => $dnsServerForDmarc, 'errors' => ['DMARC analysis could not be performed.']];
-
         return [
             'domainAnalyzed' => $this->domain,
             'dnsServerUsedGlobalOverride' => $this->initialDnsServerOverride, 
@@ -379,6 +433,26 @@ class SpfDmarcCheck {
             'dmarcDetails' => $dmarcAnalysisDetails
         ];
     }
+    
+    private function _getEmptySpfDetails() : array {
+        return [
+            'domain' => $this->domain, 'dnsServerUsed' => $this->initialDnsServerOverride,
+            'queriedDnsForTxt' => false, 'selectedSpfRecord' => null,
+            'formalValidity' => ['startsWithVspf1' => false, 'hasValidAllMechanism' => false, 'dnsMechanismLookupCount' => 0, 'maxDnsMechanismLookups' => MAX_DNS_LOOKUPS_MECHANISMS, 'voidLookupCount' => 0, 'maxVoidLookups' => MAX_VOID_LOOKUPS, 'hasRedirectModifier' => false, 'redirectDomain' => null, 'syntaxErrors' => [], 'warnings' => [], 'explanationDomain' => null,],
+            'parsedMechanisms' => [], 'allMechanismDetails' => null,
+            'collectedIpAddresses' => ['ip4' => [], 'ip6' => [], 'fromA' => [], 'fromMx' => []],
+            'summary' => ['totalDnsMechanismLookupsUsed' => 0, 'finalProcessingResult' => 'TEMPERROR', 'evaluationLog' => []]
+        ];
+    }
+    private function _getEmptyDmarcDetails() : array {
+         return [
+            'recordFound' => false, 'record' => null, 'dnsQueryDomain' => '_dmarc.' . $this->domain, 'dnsServerUsed' => $this->initialDnsServerOverride,
+            'policy' => null, 'subdomainPolicy' => null, 'alignmentDkim' => 'r', 'alignmentSpf' => 'r',  
+            'percentage' => 100, 'reportingUrisAggregate' => [], 'reportingUrisFailure' => [],
+            'failureOptions' => [], 'errors' => [], 'warnings' => []
+        ];
+    }
+
 
     /**
      * Pulisce ricorsivamente gli array di IP nei meccanismi SPF.
@@ -394,5 +468,3 @@ class SpfDmarcCheck {
         }
     }
 }
-
-

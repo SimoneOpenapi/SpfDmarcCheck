@@ -1,0 +1,693 @@
+{
+  "openapi": "3.0.0",
+  "info": {
+    "title": "Email Authentication Analysis and Item API",
+    "version": "1.1.0",
+    "description": "An example API to analyze SPF/DMARC for a domain and manage items, demonstrating the use of OpenAPI components.",
+    "contact": {
+      "name": "API Support",
+      "url": "http://www.example.com/support",
+      "email": "support@example.com"
+    },
+    "license": {
+      "name": "Apache 2.0",
+      "url": "http://www.apache.org/licenses/LICENSE-2.0.html"
+    }
+  },
+  "servers": [
+    {
+      "url": "https://api.example.com/v1",
+      "description": "Production Server"
+    },
+    {
+      "url": "https://sandbox-api.example.com/v1",
+      "description": "Sandbox Server"
+    }
+  ],
+  "paths": {
+    "/items": {
+      "get": {
+        "summary": "List all items",
+        "operationId": "listItems",
+        "tags": [
+          "Items"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/LimitParam"
+          },
+          {
+            "$ref": "#/components/parameters/OffsetParam"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/ItemsResponse"
+          },
+          "default": {
+            "$ref": "#/components/responses/ErrorResponse"
+          }
+        }
+      },
+      "post": {
+        "summary": "Create a new item",
+        "operationId": "createItem",
+        "tags": [
+          "Items"
+        ],
+        "requestBody": {
+          "$ref": "#/components/requestBodies/ItemRequest"
+        },
+        "responses": {
+          "201": {
+            "$ref": "#/components/responses/ItemResponse"
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidInputResponse"
+          },
+          "default": {
+            "$ref": "#/components/responses/ErrorResponse"
+          }
+        },
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
+      }
+    },
+    "/items/{itemId}": {
+      "get": {
+        "summary": "Get an item by ID",
+        "operationId": "getItemById",
+        "tags": [
+          "Items"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ItemIdParam"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/ItemResponse"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFoundResponse"
+          },
+          "default": {
+            "$ref": "#/components/responses/ErrorResponse"
+          }
+        }
+      }
+    },
+    "/email-auth-check/{domainName}": {
+      "get": {
+        "summary": "Analyzes SPF and DMARC for a specified domain.",
+        "operationId": "checkEmailAuthentication",
+        "tags": [
+          "EmailAuthentication"
+        ],
+        "parameters": [
+          {
+            "name": "domainName",
+            "in": "path",
+            "required": true,
+            "description": "The domain name to analyze.",
+            "schema": {
+              "type": "string",
+              "example": "example.com"
+            }
+          },
+          {
+            "name": "dns_server",
+            "in": "query",
+            "description": "Optional DNS server to use for queries. If not specified, DNS rotation or system resolver will be used.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "ipv4",
+              "example": "8.8.8.8"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Email authentication analysis results.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EmailAuthReport"
+                },
+                "examples": {
+                  "successReport": {
+                    "summary": "Example of a successful analysis",
+                    "value": {
+                      "domainAnalyzed": "example.com",
+                      "dnsServerUsedGlobalOverride": "8.8.8.8",
+                      "validSpf": true,
+                      "spfDetails": {
+                        "domain": "example.com",
+                        "dnsServerUsed": "8.8.8.8",
+                        "queriedDnsForTxt": true,
+                        "selectedSpfRecord": "v=spf1 ip4:192.0.2.0/24 ip4:198.51.100.0/24 mx -all",
+                        "formalValidity": {
+                          "startsWithVspf1": true,
+                          "hasValidAllMechanism": true,
+                          "dnsMechanismLookupCount": 1,
+                          "maxDnsMechanismLookups": 10,
+                          "voidLookupCount": 0,
+                          "maxVoidLookups": 2,
+                          "hasRedirectModifier": false,
+                          "redirectDomain": null,
+                          "syntaxErrors": [],
+                          "warnings": [],
+                          "explanationDomain": null
+                        },
+                        "parsedMechanisms": [
+                          {"term": "ip4:192.0.2.0/24", "mechanism": "ip4", "value": "192.0.2.0/24", "qualifier": "+", "ipsFound": ["192.0.2.0/24"]},
+                          {"term": "ip4:198.51.100.0/24", "mechanism": "ip4", "value": "198.51.100.0/24", "qualifier": "+", "ipsFound": ["198.51.100.0/24"]},
+                          {"term": "mx", "mechanism": "mx", "qualifier": "+", "ipsFound": ["203.0.113.10", "203.0.113.11"]},
+                          {"term": "-all", "mechanism": "all", "qualifier": "-"}
+                        ],
+                        "allMechanismDetails": {"term": "-all", "qualifier": "-", "result": "FAIL"},
+                        "collectedIpAddresses": {"ip4": ["192.0.2.0/24", "198.51.100.0/24"], "fromMx": ["203.0.113.10", "203.0.113.11"]},
+                        "summary": {"totalDnsMechanismLookupsUsed": 1, "finalProcessingResult": "FAIL", "evaluationLog": ["Mechanism 'all' encountered with result: FAIL"]}
+                      },
+                      "validDmarc": true,
+                      "dmarcDetails": {
+                        "recordFound": true,
+                        "record": "v=DMARC1; p=reject; rua=mailto:dmarc-agg@example.com; ruf=mailto:dmarc-forensic@example.com; fo=1; adkim=s; aspf=s; pct=100",
+                        "dnsQueryDomain": "_dmarc.example.com",
+                        "dnsServerUsed": "8.8.8.8",
+                        "policy": "reject",
+                        "subdomainPolicy": null,
+                        "alignmentDkim": "s",
+                        "alignmentSpf": "s",
+                        "percentage": 100,
+                        "reportingUrisAggregate": ["mailto:dmarc-agg@example.com"],
+                        "reportingUrisFailure": ["mailto:dmarc-forensic@example.com"],
+                        "failureOptions": ["1"],
+                        "errors": [],
+                        "warnings": []
+                      }
+                    }
+                  },
+                  "spfNotFound": {
+                    "summary": "Example when SPF record is not found",
+                     "value": {
+                      "domainAnalyzed": "no-spf-domain.com",
+                      "dnsServerUsedGlobalOverride": null,
+                      "validSpf": false,
+                      "spfDetails": {
+                        "domain": "no-spf-domain.com",
+                        "dnsServerUsed": "1.1.1.1",
+                        "queriedDnsForTxt": true,
+                        "selectedSpfRecord": null,
+                        "formalValidity": {"syntaxErrors": ["No SPF record (v=spf1) found for 'no-spf-domain.com'."]},
+                        "summary": {"finalProcessingResult": "NONE"}
+                      },
+                      "validDmarc": false,
+                      "dmarcDetails": {
+                        "recordFound": false,
+                        "dnsQueryDomain": "_dmarc.no-spf-domain.com",
+                        "dnsServerUsed": "1.1.1.1",
+                        "errors": ["No DMARC record (v=DMARC1) found for '_dmarc.no-spf-domain.com'."]
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidInputResponse"
+          },
+          "404": {
+             "description": "Invalid or unanalyzable domain.",
+             "content": {
+               "application/json": {
+                 "schema": {
+                   "$ref": "#/components/schemas/Error"
+                 },
+                 "example": {
+                   "code": 40401,
+                   "message": "Domain 'invalid-domain' is not a valid domain name."
+                 }
+               }
+             }
+          },
+          "default": {
+            "$ref": "#/components/responses/ErrorResponse"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Item": {
+        "type": "object",
+        "required": [
+          "id",
+          "name"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Unique identifier for the item.",
+            "example": "d290f1ee-6c54-4b01-90e6-d701748f0851"
+          },
+          "name": {
+            "type": "string",
+            "description": "Name of the item.",
+            "example": "Example Product"
+          },
+          "description": {
+            "type": "string",
+            "description": "Optional description of the item.",
+            "example": "This is a detailed description of the product."
+          },
+          "price": {
+            "type": "number",
+            "format": "float",
+            "description": "Price of the item.",
+            "example": 19.99
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "example": ["new", "special-offer"]
+          }
+        }
+      },
+      "NewItem": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Name of the new item.",
+            "example": "Awesome New Product"
+          },
+          "description": {
+            "type": "string",
+            "description": "Optional description of the new item.",
+            "example": "Description for the new product."
+          },
+          "price": {
+            "type": "number",
+            "format": "float",
+            "description": "Price of the new item.",
+            "example": 25.50
+          }
+        }
+      },
+      "Error": {
+        "type": "object",
+        "required": [
+          "code",
+          "message"
+        ],
+        "properties": {
+          "code": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Error code."
+          },
+          "message": {
+            "type": "string",
+            "description": "Error message."
+          },
+          "details": {
+            "type": "string",
+            "description": "Additional details about the error (optional).",
+            "example": "The field 'X' is missing."
+          }
+        }
+      },
+      "ListOfItems": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/Item"
+        }
+      },
+      "SpfFormalValidity": {
+        "type": "object",
+        "description": "Details about the formal validity of the SPF record.",
+        "properties": {
+          "startsWithVspf1": {"type": "boolean", "description": "Indicates if the record starts with 'v=spf1'."},
+          "hasValidAllMechanism": {"type": "boolean", "description": "Indicates if a valid 'all' mechanism is present."},
+          "dnsMechanismLookupCount": {"type": "integer", "description": "Count of DNS lookups for mechanisms."},
+          "maxDnsMechanismLookups": {"type": "integer", "description": "Maximum allowed DNS lookups for mechanisms."},
+          "voidLookupCount": {"type": "integer", "description": "Count of void DNS lookups."},
+          "maxVoidLookups": {"type": "integer", "description": "Maximum allowed void DNS lookups."},
+          "hasRedirectModifier": {"type": "boolean", "description": "Indicates if a 'redirect' modifier is present."},
+          "redirectDomain": {"type": "string", "nullable": true, "description": "Domain specified in the 'redirect' modifier.", "example": "_spf.example.com"},
+          "syntaxErrors": {"type": "array", "items": {"type": "string"}, "description": "List of syntax errors found.", "example": ["Unknown mechanism: xyz"]},
+          "warnings": {"type": "array", "items": {"type": "string"}, "description": "List of warnings generated during analysis.", "example": ["PTR mechanism used, which is discouraged."]},
+          "explanationDomain": {"type": "string", "nullable": true, "description": "Domain specified in the 'exp' modifier.", "example": "exp.example.com"}
+        }
+      },
+      "SpfMechanism": {
+        "type": "object",
+        "description": "Details of a parsed SPF mechanism. Structure may vary based on mechanism type (e.g., includedReport, redirectedReport).",
+        "properties": {
+            "term": {"type": "string", "description": "The original mechanism term.", "example": "+mx"},
+            "mechanism": {"type": "string", "description": "The type of mechanism (e.g., 'ip4', 'include', 'a').", "example": "mx"},
+            "value": {"type": "string", "nullable": true, "description": "The value associated with the mechanism.", "example": "mail.example.com"},
+            "qualifier": {"type": "string", "description": "The qualifier of the mechanism (+, -, ~, ?).", "example": "+"},
+            "lookupCost": {"type": "integer", "description": "The DNS lookup cost of the mechanism.", "example": 1},
+            "isVoidLookup": {"type": "boolean", "description": "Indicates if this mechanism resulted in a void lookup."},
+            "ipsFound": {"type": "array", "items": {"type": "string"}, "description": "IPs specifically found by this mechanism.", "example": ["192.0.2.1", "2001:db8::1"]},
+            "effectiveResultIfMatched": {"type": "string", "description": "The SPF result if this mechanism were to match (PASS, FAIL, etc.).", "example": "PASS"},
+            "includedReport": { "$ref": "#/components/schemas/SpfDetails", "description": "Recursive report for an 'include' mechanism.", "nullable": true },
+            "redirectedReport": { "$ref": "#/components/schemas/SpfDetails", "description": "Recursive report for a 'redirect' modifier.", "nullable": true }
+        },
+        "additionalProperties": true 
+      },
+      "SpfAllMechanismDetails": {
+          "type": "object",
+          "nullable": true,
+          "description": "Details of the 'all' mechanism if present.",
+          "properties": {
+              "term": {"type": "string", "example": "-all"},
+              "qualifier": {"type": "string", "example": "-"},
+              "result": {"type": "string", "example": "FAIL"}
+          }
+      },
+      "SpfCollectedIpAddresses": {
+          "type": "object",
+          "description": "IP addresses collected during SPF analysis.",
+          "properties": {
+              "ip4": {"type": "array", "items": {"type": "string"}, "example": ["192.0.2.0/24"]},
+              "ip6": {"type": "array", "items": {"type": "string"}, "example": ["2001:db8:1234::/48"]},
+              "fromA": {"type": "array", "items": {"type": "string"}, "example": ["203.0.113.5"]},
+              "fromMx": {"type": "array", "items": {"type": "string"}, "example": ["203.0.113.10"]}
+          }
+      },
+      "SpfSummary": {
+          "type": "object",
+          "description": "Summary of the SPF analysis.",
+          "properties": {
+              "totalDnsMechanismLookupsUsed": {"type": "integer", "example": 3},
+              "finalProcessingResult": {"type": "string", "description": "Final processing result of the SPF record (e.g., NEUTRAL, PERMERROR, NONE).", "example": "FAIL"},
+              "evaluationLog": {"type": "array", "items": {"type": "string"}, "example": ["Mechanism 'mx' matched.", "Mechanism '-all' encountered."]}
+          }
+      },
+      "SpfDetails": {
+        "type": "object",
+        "description": "Complete details of the SPF record analysis.",
+        "properties": {
+          "domain": {"type": "string", "example": "example.com"},
+          "dnsServerUsed": {"type": "string", "nullable": true, "description": "DNS server used for this specific SPF analysis.", "example": "8.8.8.8"},
+          "queriedDnsForTxt": {"type": "boolean"},
+          "selectedSpfRecord": {"type": "string", "nullable": true, "example": "v=spf1 mx -all"},
+          "formalValidity": {"$ref": "#/components/schemas/SpfFormalValidity"},
+          "parsedMechanisms": {"type": "array", "items": {"$ref": "#/components/schemas/SpfMechanism"}},
+          "allMechanismDetails": {"$ref": "#/components/schemas/SpfAllMechanismDetails"},
+          "collectedIpAddresses": {"$ref": "#/components/schemas/SpfCollectedIpAddresses"},
+          "summary": {"$ref": "#/components/schemas/SpfSummary"}
+        }
+      },
+      "DmarcDetails": {
+        "type": "object",
+        "description": "Complete details of the DMARC record analysis.",
+        "properties": {
+          "recordFound": {"type": "boolean"},
+          "record": {"type": "string", "nullable": true, "example": "v=DMARC1; p=reject; rua=mailto:dmarc@example.com"},
+          "dnsQueryDomain": {"type": "string", "example": "_dmarc.example.com"},
+          "dnsServerUsed": {"type": "string", "nullable": true, "description": "DNS server used for this specific DMARC analysis.", "example": "1.1.1.1"},
+          "policy": {"type": "string", "nullable": true, "enum": ["none", "quarantine", "reject"], "example": "reject"},
+          "subdomainPolicy": {"type": "string", "nullable": true, "enum": ["none", "quarantine", "reject"], "example": "none"},
+          "alignmentDkim": {"type": "string", "enum": ["r", "s"], "example": "r"},
+          "alignmentSpf": {"type": "string", "enum": ["r", "s"], "example": "r"},
+          "percentage": {"type": "integer", "example": 100},
+          "reportingUrisAggregate": {"type": "array", "items": {"type": "string"}, "example": ["mailto:aggrep@example.com"]},
+          "reportingUrisFailure": {"type": "array", "items": {"type": "string"}, "example": ["mailto:authfail@example.com"]},
+          "failureOptions": {"type": "array", "items": {"type": "string"}, "example": ["0", "1", "d", "s"]},
+          "errors": {"type": "array", "items": {"type": "string"}, "example": ["Invalid tag: xyz=abc"]},
+          "warnings": {"type": "array", "items": {"type": "string"}, "example": ["pct tag not found, defaulting to 100."]}
+        }
+      },
+      "EmailAuthReport": {
+        "type": "object",
+        "description": "Complete email authentication analysis report for a domain.",
+        "properties": {
+          "domainAnalyzed": {
+            "type": "string",
+            "description": "The domain that was analyzed.",
+            "example": "example.com"
+          },
+          "dnsServerUsedGlobalOverride": {
+            "type": "string",
+            "nullable": true,
+            "description": "The DNS server specified as a global override, if any.",
+            "example": "8.8.8.8"
+          },
+          "validSpf": {
+            "type": "boolean",
+            "description": "Indicates if a valid and processable SPF record was found (does not imply a 'PASS' result for a specific IP)."
+          },
+          "spfDetails": {
+            "$ref": "#/components/schemas/SpfDetails"
+          },
+          "validDmarc": {
+            "type": "boolean",
+            "description": "Indicates if a valid and processable DMARC record was found."
+          },
+          "dmarcDetails": {
+            "$ref": "#/components/schemas/DmarcDetails"
+          }
+        }
+      }
+    },
+    "parameters": {
+      "ItemIdParam": {
+        "name": "itemId",
+        "in": "path",
+        "description": "ID of the item to retrieve.",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "LimitParam": {
+        "name": "limit",
+        "in": "query",
+        "description": "Maximum number of items to return.",
+        "required": false,
+        "schema": {
+          "type": "integer",
+          "format": "int32",
+          "minimum": 1,
+          "default": 20
+        }
+      },
+      "OffsetParam": {
+        "name": "offset",
+        "in": "query",
+        "description": "Number of items to skip for pagination.",
+        "required": false,
+        "schema": {
+          "type": "integer",
+          "format": "int32",
+          "minimum": 0,
+          "default": 0
+        }
+      }
+    },
+    "responses": {
+      "ItemResponse": {
+        "description": "Response for a single item.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Item"
+            }
+          }
+        },
+        "headers": {
+          "X-RateLimit-Limit": {
+            "$ref": "#/components/headers/RateLimitLimit"
+          }
+        }
+      },
+      "ItemsResponse": {
+        "description": "A list of items.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ListOfItems"
+            }
+          }
+        },
+        "headers": {
+          "X-Total-Count": {
+            "description": "Total number of items available.",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        }
+      },
+      "NotFoundResponse": {
+        "description": "The requested resource was not found.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            },
+            "example": {
+              "code": 404,
+              "message": "Resource not found."
+            }
+          }
+        }
+      },
+      "InvalidInputResponse": {
+        "description": "Invalid input provided.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            },
+            "example": {
+              "code": 400,
+              "message": "Invalid input for field 'X'."
+            }
+          }
+        }
+      },
+      "ErrorResponse": {
+        "description": "Generic error response.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            },
+            "example": {
+              "code": 500,
+              "message": "An internal server error occurred."
+            }
+          }
+        }
+      }
+    },
+    "requestBodies": {
+      "ItemRequest": {
+        "description": "Request body for creating or updating an item.",
+        "required": true,
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/NewItem"
+            }
+          },
+          "application/xml": {
+            "schema": {
+              "$ref": "#/components/schemas/NewItem"
+            }
+          }
+        }
+      }
+    },
+    "headers": {
+      "RateLimitLimit": {
+        "description": "The number of allowed requests in the current window.",
+        "schema": {
+          "type": "integer"
+        }
+      },
+      "RateLimitRemaining": {
+        "description": "The number of remaining requests in the current window.",
+        "schema": {
+          "type": "integer"
+        }
+      },
+      "RateLimitReset": {
+        "description": "The remaining time in seconds before the rate limit resets.",
+        "schema": {
+          "type": "integer"
+        }
+      }
+    },
+    "securitySchemes": {
+      "ApiKeyAuth": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-API-KEY",
+        "description": "Authentication via API Key in X-API-KEY header."
+      },
+      "BearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT",
+        "description": "Authentication via Bearer Token (JWT)."
+      },
+      "OAuth2AuthCode": {
+        "type": "oauth2",
+        "description": "OAuth2 authentication with Authorization Code flow.",
+        "flows": {
+          "authorizationCode": {
+            "authorizationUrl": "https://example.com/oauth/authorize",
+            "tokenUrl": "https://example.com/oauth/token",
+            "scopes": {
+              "read:items": "Permission to read items",
+              "write:items": "Permission to write items",
+              "read:email-auth": "Permission to read email authentication data"
+            }
+          }
+        }
+      }
+    },
+    "links": {
+      "GetItemById": {
+        "description": "Link to get the newly created item using the ID from the response.",
+        "operationId": "getItemById",
+        "parameters": {
+          "itemId": "$response.body#/id"
+        }
+      }
+    },
+    "callbacks": {
+      "ItemUpdateCallback": {
+        "{$request.body#/callbackUrl}": {
+          "post": {
+            "requestBody": {
+              "description": "Item update notification.",
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/Item"
+                  }
+                }
+              }
+            },
+            "responses": {
+              "200": {
+                "description": "Callback received successfully."
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "Items",
+      "description": "Operations related to items."
+    },
+    {
+      "name": "EmailAuthentication",
+      "description": "Operations related to email authentication analysis (SPF, DMARC)."
+    }
+  ]
+}
